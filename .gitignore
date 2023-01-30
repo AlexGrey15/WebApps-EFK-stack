@@ -1,0 +1,11 @@
+./voting/node_modules
+./voting/public/hot
+./voting/public/storage
+./voting/storage/*.key
+./voting/vendor
+./voting/.env
+./voting/.env.backup
+.env
+.phpunit.result.cache
+.docker/
+.idea/

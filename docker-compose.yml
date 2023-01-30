@@ -1,0 +1,179 @@
+version: "3"
+services:
+  nginx:
+    depends_on:
+      - voting
+      - fluentd
+    image: nginx:alpine
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+    ports:
+      - ${NGINX_PORT}:80
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: localhost:24224
+        tag: docker.nginx.access
+    networks:
+      - frontend
+      - logend
+
+  php:
+    depends_on:
+      - fluentd
+      - mysql
+      - redis
+    image: php:latest
+    ports:
+      - 8000:9000
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: localhost:24224
+        tag: docker.voting.access
+    networks:
+      - frontend
+      - backend
+      - logend
+
+  mysql:
+    depends_on:
+      - fluentd
+    image:
+      mysql:latest
+    volumes:
+      - ./mysql/mysql_v1.sql:/tmp/mysql.sql
+      - ./mysql/my_wrapper_script.sh:/tmp/my_wrapper_script.sh
+    ports:
+      - ${MYSQL_PORT}:3306
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: localhost:24224
+        tag: docker.mysql.access
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD}
+    entrypoint: ''
+    command: /bin/bash -c '/tmp/my_wrapper_script.sh'
+    networks:
+      - backend
+      - logend
+
+  redis:
+    depends_on:
+      - fluentd
+    image:
+      redis:latest
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: localhost:24224
+        tag: docker.redis.access
+    networks:
+      - backend
+      - logend
+
+  fluentd:
+    depends_on:
+      - elasticsearch
+    image: fluentd_my:1.0
+    build: ./fluentd
+    volumes:
+      - ./fluentd/conf:/fluentd/etc
+      - ./certs/:/fluentd/etc/certs/
+    ports:
+      - ${FLUENTD_TCP_PORT}:24224
+      - ${FLUENTD_UDP_PORT}:24224/udp
+    networks:
+      - logend
+
+  elasticsearch:
+    image: elasticsearch:${STACK_VERSION}
+    volumes:
+      - ./certs/:/usr/share/elasticsearch/config/certs/
+    ports:
+      - ${ES_PORT}:9200
+    environment:
+      - node.name=elasticsearch
+      - cluster.name=docker-cluster
+      - cluster.initial_master_nodes=elasticsearch
+      - ELASTIC_PASSWORD=${ES_PASSWORD}
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/${ES_NAME}/${ES_NAME}.key
+      - xpack.security.http.ssl.certificate=certs/${ES_NAME}/${ES_NAME}.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.http.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/${ES_NAME}/${ES_NAME}.key
+      - xpack.security.transport.ssl.certificate=certs/${ES_NAME}/${ES_NAME}.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.security.enrollment.enabled=true
+    entrypoint: ''
+    command: >
+      bash -c '
+        set -m
+        /bin/tini -- /usr/local/bin/docker-entrypoint.sh eswrapper &
+        
+        if [ x${ES_PASSWORD} == x ]; then
+          echo "Set the ES_PASSWORD environment variable in the .env file";
+          exit 1;
+        elif [ x${KIBANA_PASSWORD} == x ]; then
+          echo "Set the KIBANA_PASSWORD environment variable in the .env file";
+          exit 1;
+        fi;
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+          unzip config/certs/ca.zip -d config/certs;
+        fi;
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "Creating certs";
+          echo -ne \
+          "instances:\n"\
+          "  - name: ${ES_NAME}\n"\
+          > config/certs/instances.yml;
+          bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+          unzip config/certs/certs.zip -d config/certs;
+        fi;
+
+        echo "Waiting for Elasticsearch availability";
+        until curl -s --cacert config/certs/ca/ca.crt https://${ES_NAME}:9200 | grep -q "missing authentication credentials"; do sleep 30; done;
+        echo "Setting kibana_system password";
+        until curl -s -X POST --cacert config/certs/ca/ca.crt -u "elastic:${ES_PASSWORD}" -H "Content-Type: application/json" https://${ES_NAME}:9200/_security/user/kibana_system/_password -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
+        echo "All done!";
+        fg %1
+      '
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    networks:
+      - logend
+
+  kibana:
+    depends_on:
+      - elasticsearch
+    image: kibana:${STACK_VERSION}
+    volumes:
+      - ./certs/:/usr/share/kibana/config/certs/
+    ports:
+      - ${KIBANA_PORT}:5601
+    environment:
+      - ELASTICSEARCH_HOSTS=https://${ES_NAME}:${ES_PORT}
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+    networks:
+      - logend
+
+networks:
+  frontend:
+  backend:
+  logend:
